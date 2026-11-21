@@ -5,24 +5,24 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
-import { isPersistentKeyConfigured } from './server/security/cryptoVault.ts';
+import { isPersistentKeyConfigured } from './server/security/cryptoVault.js';
 import {
   createRateLimitMiddleware,
   getFirewallTelemetry,
   safeExternalFetch,
   securityHeadersMiddleware,
   wafInspectionMiddleware,
-} from './server/security/firewall.ts';
+} from './server/security/firewall.js';
 import {
   getIntegrityReport,
   initializeIntegrityManifest,
-} from './server/security/integrityGuard.ts';
+} from './server/security/integrityGuard.js';
 import {
   getEncryptedLocalDbStateResponse,
   getLocalDbRotationCursor,
   loadEncryptedLocalDbFromDisk,
   saveSyncedBatchToEncryptedStore,
-} from './server/security/localDbStore.ts';
+} from './server/security/localDbStore.js';
 import type {
   BatchAnnotateResponse,
   BatchLookupQueryStatus,
@@ -37,14 +37,14 @@ import type {
   PubMedArticleRef,
   SecurityStatusResponse,
   VariantRecord,
-} from './src/types/variant.ts';
+} from './src/types/variant.js';
 import {
   buildFallbackCatalogFromClinGen,
   parseHgncProteinCodingTsv,
   searchGenomeCatalog,
   selectNextUncrawledGenes,
-} from './src/utils/genomeCatalog.ts';
-import { getPrioritySyncGeneSequence } from './src/utils/localGenomicDb.ts';
+} from './src/utils/genomeCatalog.js';
+import { getPrioritySyncGeneSequence } from './src/utils/localGenomicDb.js';
 import {
   asString,
   clingenTierToActionability,
@@ -58,14 +58,14 @@ import {
   pickBestClinGenCuration,
   type ClinGenCurationEntry,
   type MyVariantHit,
-} from './src/utils/liveDatabaseMappers.ts';
+} from './src/utils/liveDatabaseMappers.js';
 import {
   detectPipelineFormat,
   parseCmaBedVariants,
   parseVcfVariants,
   summarizeAcmgBatch,
-} from './src/utils/pipelineParsers.ts';
-import { parseImportedCsv } from './src/utils/prioritisation.ts';
+} from './src/utils/pipelineParsers.js';
+import { parseImportedCsv } from './src/utils/prioritisation.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
