@@ -2,9 +2,9 @@ import {
   CODED_CONDITIONS,
   EXTENDED_CODED_VUS,
   EXTENDED_GENE_METADATA,
-} from '../data/extendedGenomes';
-import { GENE_METADATA } from '../data/genes';
-import { CURATED_VARIANTS } from '../data/variants';
+} from '../data/extendedGenomes.js';
+import { GENE_METADATA } from '../data/genes.js';
+import { CURATED_VARIANTS } from '../data/variants.js';
 import type {
   CodedConditionRecord,
   ExternalDatabaseToolId,
@@ -15,9 +15,9 @@ import type {
   ReclassificationEvent,
   ToolSyncStatus,
   VariantRecord,
-} from '../types/variant';
-import { evaluateAcmgCriteria } from './acmgAutomation';
-import { filterVariants } from './prioritisation';
+} from '../types/variant.js';
+import { evaluateAcmgCriteria } from './acmgAutomation.js';
+import { filterVariants } from './prioritisation.js';
 
 export interface LocalGenomicDatabase {
   genesBySymbol: Record<string, GeneMetadata>;
