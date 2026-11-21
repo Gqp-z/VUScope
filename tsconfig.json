@@ -1,10 +1,13 @@
 {
   "compilerOptions": {
+    "rewriteRelativeImportExtensions": true
+  }
+}
     "target": "ES2022",
     "experimentalDecorators": true,
     "useDefineForClassFields": false,
     "module": "ESNext",
-    "types": ["vite/client"],
+    "types": ,
     "lib": [
       "ES2022",
       "DOM",
