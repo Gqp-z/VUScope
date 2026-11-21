@@ -1,0 +1,6 @@
+{
+  "name": "VUScope",
+  "description": "Computational decision-support workbench for prioritising Variants of Uncertain Significance (VUS) across ClinVar, gnomAD, dbNSFP, PubMed, and ClinGen.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
