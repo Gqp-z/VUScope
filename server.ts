@@ -389,7 +389,7 @@ function parseLookupInput(rawQuery: string) {
   };
 }
 
-async function createApp() {
+export async function createApp() {
   initializeIntegrityManifest();
   loadEncryptedLocalDbFromDisk();
 
@@ -1124,44 +1124,47 @@ function buildGeneMetadataFromLookup(payload: LiveLookupResponse): GeneMetadata 
     res.json(response);
   });
 
-  const httpServer = http.createServer(app);
-
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        ws: { server: httpServer },
-        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
-      },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distDir = path.resolve(__dirname, 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req: Request, res: Response) => {
-      const indexFile = path.join(distDir, 'index.html');
-      if (fs.existsSync(indexFile)) {
-        res.sendFile(indexFile);
-      } else {
-        res.status(404).send('Build output not found.');
-      }
-    });
-  }
-
-  const port = Number(process.env.PORT ?? 3000);
-  httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`VUScope server running on http://localhost:${port}`);
-    // Automatically synchronize local genomic database with external tools shortly after boot
-    setTimeout(() => {
-      void runLocalDbToolSync().catch(() => {
-        // Non-fatal if external network is temporarily unavailable
-      });
-    }, 1200);
-  });
+  return { app, runLocalDbToolSync };
 }
 
-createApp().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (!process.env.VERCEL) {
+  createApp()
+    .then(async ({ app, runLocalDbToolSync }) => {
+      const httpServer = http.createServer(app);
+
+      if (process.env.NODE_ENV !== 'production') {
+        const vite = await createViteServer({
+          server: {
+            middlewareMode: true,
+            ws: { server: httpServer },
+            hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+          },
+          appType: 'spa',
+        });
+        app.use(vite.middlewares);
+      } else {
+        const distDir = path.resolve(__dirname, 'dist');
+        app.use(express.static(distDir));
+        app.get('*', (_req: Request, res: Response) => {
+          const indexFile = path.join(distDir, 'index.html');
+          if (fs.existsSync(indexFile)) {
+            res.sendFile(indexFile);
+          } else {
+            res.status(404).send('Build output not found.');
+          }
+        });
+      }
+
+      const port = Number(process.env.PORT ?? 3000);
+      httpServer.listen(port, '0.0.0.0', () => {
+        console.log(`VUScope server running on http://localhost:${port}`);
+        setTimeout(() => {
+          void runLocalDbToolSync().catch(() => {});
+        }, 1200);
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    });
+}
