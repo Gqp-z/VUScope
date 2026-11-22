@@ -82,11 +82,21 @@ const LOOKUP_CACHE_MAX_ENTRIES = 2500;
 
 let clingenCache: {
   loadedAt: number;
-  byGene: Map<string, ClinGenCurationEntry[]>;
+  byGene: Record<string, ClinGenCurationEntry[]>;
 } | null = null;
-let clingenLoadPromise: Promise> | null = null;
+let clingenLoadPromise: Promise<Record<string, ClinGenCurationEntry[]>> | null = null;
 
-async function getClinGenMap(): Promise> {
+function toGeneRecord(
+  map: Map<string, ClinGenCurationEntry[]>,
+): Record<string, ClinGenCurationEntry[]> {
+  const record: Record<string, ClinGenCurationEntry[]> = {};
+  for (const [key, value] of map.entries()) {
+    record[key] = value;
+  }
+  return record;
+}
+
+async function getClinGenMap(): Promise<Record<string, ClinGenCurationEntry[]>> {
   if (clingenCache && Date.now() - clingenCache.loadedAt < CLINGEN_CACHE_TTL_MS) {
     return clingenCache.byGene;
   }
@@ -100,17 +110,17 @@ async function getClinGenMap(): Promise> {
         timeoutMs: 9000,
       });
       if (!resp.ok) {
-        return clingenCache?.byGene ?? new Map<string, ClinGenCurationEntry[]>();
+        return clingenCache?.byGene ?? {};
       }
       const csvText = await resp.text();
-      const byGene = parseClinGenValidityCsv(csvText);
+      const byGene = toGeneRecord(parseClinGenValidityCsv(csvText));
       clingenCache = {
         loadedAt: Date.now(),
         byGene,
       };
       return byGene;
     } catch {
-      return clingenCache?.byGene ?? new Map<string, ClinGenCurationEntry[]>();
+      return clingenCache?.byGene ?? {};
     } finally {
       clingenLoadPromise = null;
     }
