@@ -1131,11 +1131,13 @@ if (!process.env.VERCEL) {
     .then(async ({ app, runLocalDbToolSync }) => {
       const httpServer = http.createServer(app);
 
-if (process.env.NODE_ENV !== 'production') {
-        const vitePkg = ['vi', 'te'].join('');
-        const { createServer: createViteServer } = await import(
-          /* @vite-ignore */ vitePkg
-        );
+if (!process.env.VERCEL) {
+  createApp()
+    .then(async ({ app, runLocalDbToolSync }) => {
+      const httpServer = http.createServer(app);
+
+      if (process.env.NODE_ENV !== 'production') {
+        const { createServer: createViteServer } = await import('vite');
         const vite = await createViteServer({
           server: {
             middlewareMode: true,
@@ -1145,7 +1147,13 @@ if (process.env.NODE_ENV !== 'production') {
           appType: 'spa',
         });
         app.use(vite.middlewares);
-      }
+      } else {
+        const distDir = path.resolve(__dirname, 'dist');
+        app.use(express.static(distDir));
+        app.get('*', (_req: Request, res: Response) => {
+          const indexFile = path.join(distDir, 'index.html');
+          if (fs.existsSync(indexFile)) {
+            res.sendFile(indexFile);
           } else {
             res.status(404).send('Build output not found.');
           }
