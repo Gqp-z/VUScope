@@ -1,5 +1,5 @@
-import type { VariantRecord, VariantType } from '../types/variant';
-import { evaluateAcmgCriteria } from './acmgAutomation';
+import type { VariantRecord, VariantType } from '../types/variant.js';
+import { evaluateAcmgCriteria } from './acmgAutomation.js';
 
 export function parseBulkLookupInput(rawText: string): string[] {
   const lines = rawText
