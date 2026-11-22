@@ -4,7 +4,7 @@ import type {
   GeneMetadata,
   VariantRecord,
   VariantType,
-} from '../types/variant';
+} from '../types/variant.js';
 
 interface CompactGeneSpec {
   symbol: string;
