@@ -84,9 +84,9 @@ let clingenCache: {
   loadedAt: number;
   byGene: Map<string, ClinGenCurationEntry[]>;
 } | null = null;
-let clingenLoadPromise: Promise<Map<string, ClinGenCurationEntry[]>> | null = null;
+let clingenLoadPromise: Promise> | null = null;
 
-async function getClinGenMap(): Promise<Map<string, ClinGenCurationEntry[]>> {
+async function getClinGenMap(): Promise> {
   if (clingenCache && Date.now() - clingenCache.loadedAt < CLINGEN_CACHE_TTL_MS) {
     return clingenCache.byGene;
   }
@@ -203,7 +203,11 @@ async function getGenomeCatalog(): Promise<GenomeCatalogCacheState> {
       source,
       clingenCuratedCount,
     };
-    if (!genomeCatalogCache || source === 'hgnc_live' || genomeCatalogCache.source === 'clingen_fallback') {
+    if (
+      !genomeCatalogCache ||
+      source === 'hgnc_live' ||
+      genomeCatalogCache.source === 'clingen_fallback'
+    ) {
       genomeCatalogCache = state;
     }
     return genomeCatalogCache ?? state;
@@ -229,7 +233,9 @@ interface MyGeneDoc {
   name?: string;
   HGNC?: string;
   ensembl?: { gene?: string } | Array<{ gene?: string }>;
-  interpro?: Array<{ id?: string; desc?: string; short_desc?: string }> | { id?: string; desc?: string; short_desc?: string };
+  interpro?:
+    | Array<{ id?: string; desc?: string; short_desc?: string }>
+    | { id?: string; desc?: string; short_desc?: string };
 }
 
 async function fetchMyGeneInfo(geneSymbol: string) {
@@ -385,6 +391,311 @@ function parseLookupInput(rawQuery: string) {
     geneHint: maybeGene.length >= 2 ? maybeGene : null,
     variantToken: restVariant || null,
     cleanQ: trimmed,
+  };
+}
+
+async function executeSingleLookup(
+  rawQuery: string,
+  size = 18,
+): Promise<LiveLookupResponse> {
+  const cacheKey = `${rawQuery.trim().toUpperCase()}::${size}`;
+  const cached = lookupResultCache.get(cacheKey);
+  if (cached && Date.now() - cached.storedAt < LOOKUP_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const pending = inFlightLookups.get(cacheKey);
+  if (pending) {
+    return pending;
+  }
+
+  const runPromise = (async () => {
+    const parsed = parseLookupInput(rawQuery);
+    let myVariantQuery: string;
+
+    if (parsed.isRsId && parsed.variantToken) {
+      myVariantQuery = `dbsnp.rsid:${parsed.variantToken}`;
+    } else if (parsed.geneHint && parsed.variantToken) {
+      myVariantQuery = `(clinvar.gene.symbol:${parsed.geneHint} OR dbnsfp.genename:${parsed.geneHint}) AND "${parsed.variantToken}"`;
+    } else if (parsed.isHgvs && parsed.variantToken) {
+      myVariantQuery = `"${parsed.variantToken}"`;
+    } else {
+      const gene = parsed.geneHint || parsed.cleanQ.toUpperCase();
+      myVariantQuery = `(clinvar.gene.symbol:${gene} OR dbnsfp.genename:${gene}) AND (clinvar.rcv.clinical_significance:"Uncertain significance" OR clinvar.rcv.clinical_significance:"Conflicting")`;
+    }
+
+    const initialGene = parsed.geneHint;
+    const [
+      mvResult,
+      clingenMapResult,
+      myGeneInitialResult,
+      clinvarCountInitialResult,
+      pubmedInitialResult,
+      pathNeighborsInitialResult,
+    ] = await Promise.allSettled([
+      fetchMyVariant(myVariantQuery, size),
+      getClinGenMap(),
+      initialGene ? fetchMyGeneInfo(initialGene) : Promise.resolve(null),
+      initialGene ? fetchClinVarTotalVusCount(initialGene) : Promise.resolve(null),
+      fetchPubMedEvidence(
+        parsed.isRsId && parsed.variantToken
+          ? parsed.variantToken
+          : initialGene
+            ? `${initialGene}[Title/Abstract] AND ("variant of uncertain significance"[Title/Abstract] OR VUS[Title/Abstract] OR functional[Title/Abstract])`
+            : `${rawQuery}[Title/Abstract]`,
+      ),
+      initialGene
+        ? fetchMyVariant(
+            `(clinvar.gene.symbol:${initialGene} OR dbnsfp.genename:${initialGene}) AND (clinvar.rcv.clinical_significance:"Pathogenic" OR clinvar.rcv.clinical_significance:"Likely pathogenic")`,
+            25,
+          )
+        : Promise.resolve(null),
+    ]);
+
+    if (mvResult.status === 'rejected') {
+      throw new Error(
+        mvResult.reason instanceof Error ? mvResult.reason.message : 'MyVariant request failed',
+      );
+    }
+
+    const data = mvResult.value;
+    const hits = data.hits ?? [];
+
+    const hitGene =
+      asString(firstScalar(hits[0]?.clinvar?.gene)?.symbol) ||
+      asString(hits[0]?.dbnsfp?.genename) ||
+      null;
+    const resolvedGene = (initialGene || hitGene || '').toUpperCase() || null;
+
+    let geneInfo =
+      myGeneInitialResult.status === 'fulfilled' ? myGeneInitialResult.value : null;
+    let clinvarTotalVus =
+      clinvarCountInitialResult.status === 'fulfilled'
+        ? clinvarCountInitialResult.value
+        : null;
+    let neighborData =
+      pathNeighborsInitialResult.status === 'fulfilled'
+        ? pathNeighborsInitialResult.value
+        : null;
+
+    if (!initialGene && resolvedGene) {
+      const [mgRes, cvRes, nbRes] = await Promise.allSettled([
+        fetchMyGeneInfo(resolvedGene),
+        fetchClinVarTotalVusCount(resolvedGene),
+        fetchMyVariant(
+          `(clinvar.gene.symbol:${resolvedGene} OR dbnsfp.genename:${resolvedGene}) AND (clinvar.rcv.clinical_significance:"Pathogenic" OR clinvar.rcv.clinical_significance:"Likely pathogenic")`,
+          25,
+        ),
+      ]);
+      if (mgRes.status === 'fulfilled') geneInfo = mgRes.value;
+      if (cvRes.status === 'fulfilled') clinvarTotalVus = cvRes.value;
+      if (nbRes.status === 'fulfilled') neighborData = nbRes.value;
+    }
+
+    const clingenMap =
+      clingenMapResult.status === 'fulfilled'
+        ? clingenMapResult.value
+        : new Map<string, ClinGenCurationEntry[]>();
+    const clingenEntries: ClinGenCurationEntry[] = resolvedGene
+      ? clingenMap.get(resolvedGene) ?? []
+      : [];
+    const clingenEntry = pickBestClinGenCuration(clingenEntries);
+
+    const geneConditions: GeneConditionAssociation[] =
+      mapClinGenEntriesToConditions(clingenEntries);
+    const seenCondKeys = new Set(
+      geneConditions.map((c) => c.condition.toLowerCase()),
+    );
+
+    for (const hit of hits) {
+      for (const cvCond of extractAllClinVarConditions(hit.clinvar?.rcv)) {
+        const key = cvCond.toLowerCase();
+        if (!seenCondKeys.has(key) && geneConditions.length < 10) {
+          seenCondKeys.add(key);
+          geneConditions.push({
+            condition: cvCond,
+            inheritance: clingenEntry
+              ? formatInheritanceLabel(clingenEntry.moi)
+              : 'ClinVar Reported',
+            clingenValidity: clingenEntry?.classification ?? 'Moderate',
+            clinicalSpectrumNote:
+              'Associated phenotype reported across ClinVar variant submissions for this gene.',
+          });
+        }
+      }
+    }
+
+    const allGeneConditions = geneConditions.map((c) => c.condition);
+
+    const pubmedEvidence =
+      pubmedInitialResult.status === 'fulfilled'
+        ? pubmedInitialResult.value
+        : { count: 0, articles: [] };
+
+    const classifiedNeighbors = extractClassifiedNeighbors(neighborData?.hits ?? []);
+
+    const variants = hits.map((hit, idx) =>
+      mapMyVariantToRecord(hit, idx, {
+        fallbackGene: resolvedGene || 'QUERY',
+        clingen: clingenEntry,
+        allGeneConditions,
+        ensemblGeneId: geneInfo?.ensemblGeneId ?? null,
+        geneInterproDomains: geneInfo?.interproDomains ?? [],
+        pubmedCount: pubmedEvidence.count,
+        pubmedArticles: pubmedEvidence.articles,
+        classifiedNeighbors,
+      }),
+    );
+
+    const hasGnomad = variants.some((v) => v.gnomadAf > 0);
+    const hasDbnsfp = variants.some(
+      (v) =>
+        v.revelScore !== null ||
+        v.caddPhred !== null ||
+        v.siftScore !== null ||
+        (v.alphaMissenseScore !== undefined && v.alphaMissenseScore !== null),
+    );
+
+    const sources: LiveDatabaseConnectionInfo[] = [
+      {
+        id: 'clinvar',
+        name: 'ClinVar (NCBI)',
+        status: 'connected',
+        summary:
+          clinvarTotalVus !== null
+            ? `${clinvarTotalVus.toLocaleString()} gene VUS indexed · ${variants.length} fetched`
+            : `${variants.length} variant records fetched`,
+        url: resolvedGene
+          ? `https://www.ncbi.nlm.nih.gov/clinvar/?term=${encodeURIComponent(`${resolvedGene}[gene]`)}`
+          : undefined,
+      },
+      {
+        id: 'gnomad',
+        name: 'gnomAD v4',
+        status: variants.length > 0 ? 'connected' : 'partial',
+        summary:
+          variants.length > 0
+            ? hasGnomad
+              ? 'Allele frequencies & PopMax annotated via MyVariant'
+              : 'Checked (fetched alleles absent / AF = 0)'
+            : 'No variants returned to annotate',
+        url: resolvedGene
+          ? `https://gnomad.broadinstitute.org/gene/${encodeURIComponent(resolvedGene)}`
+          : undefined,
+      },
+      {
+        id: 'pubmed',
+        name: 'PubMed (NCBI)',
+        status: pubmedInitialResult.status === 'fulfilled' ? 'connected' : 'unavailable',
+        summary:
+          pubmedEvidence.count > 0
+            ? `${pubmedEvidence.count.toLocaleString()} VUS/functional citations`
+            : '0 matching VUS citations',
+        url: resolvedGene
+          ? `https://pubmed.ncbi.nlm.nih.gov/?term=${encodeURIComponent(`${resolvedGene} variant of uncertain significance`)}`
+          : undefined,
+      },
+      {
+        id: 'clingen',
+        name: 'ClinGen Validity',
+        status: clingenMap.size > 0 ? 'connected' : 'unavailable',
+        summary: clingenEntry
+          ? clingenEntries.length > 1
+            ? `${clingenEntries.length} ClinGen curations (${clingenEntry.classification}: ${clingenEntries.map((e) => e.diseaseLabel).slice(0, 2).join('; ')})`
+            : `${clingenEntry.classification} (${clingenEntry.diseaseLabel})`
+          : resolvedGene
+            ? `No ClinGen validity curation for ${resolvedGene}`
+            : 'Curated gene-disease table loaded',
+        url: clingenEntry?.reportUrl ?? 'https://search.clinicalgenome.org/kb/gene-validity',
+      },
+      {
+        id: 'ensembl',
+        name: 'Ensembl / InterPro',
+        status: geneInfo?.ensemblGeneId ? 'connected' : 'partial',
+        summary: geneInfo?.ensemblGeneId
+          ? `${geneInfo.ensemblGeneId} · ${geneInfo.interproDomains.length} InterPro domains`
+          : 'Domain annotations via dbNSFP',
+        url: geneInfo?.ensemblGeneId
+          ? `https://www.ensembl.org/Homo_sapiens/Gene/Summary?g=${encodeURIComponent(geneInfo.ensemblGeneId)}`
+          : undefined,
+      },
+      {
+        id: 'dbnsfp',
+        name: 'dbNSFP & CADD',
+        status: hasDbnsfp ? 'connected' : 'partial',
+        summary: hasDbnsfp
+          ? 'REVEL, AlphaMissense, CADD Phred, SIFT & PolyPhen-2 loaded'
+          : 'Scores unavailable for non-missense hits',
+      },
+    ];
+
+    const payload: LiveLookupResponse = {
+      query: rawQuery,
+      resolvedGene,
+      totalMatches: data.total ?? variants.length,
+      clinvarTotalVus,
+      pubmedArticleCount: pubmedEvidence.count,
+      pubmedArticles: pubmedEvidence.articles,
+      clingenSummary: clingenEntry
+        ? {
+            gene: clingenEntry.geneSymbol,
+            classification: clingenEntry.classification,
+            diseaseLabel: clingenEntry.diseaseLabel,
+            moi: clingenEntry.moi,
+            expertPanel: clingenEntry.expertPanel,
+            reportUrl: clingenEntry.reportUrl,
+            actionabilityScore: clingenTierToActionability(clingenEntry.classification),
+          }
+        : null,
+      geneConditions,
+      geneInfo,
+      sources,
+      variants,
+    };
+
+    if (lookupResultCache.size >= LOOKUP_CACHE_MAX_ENTRIES) {
+      const oldestKey = lookupResultCache.keys().next().value;
+      if (oldestKey) lookupResultCache.delete(oldestKey);
+    }
+    lookupResultCache.set(cacheKey, { storedAt: Date.now(), payload });
+    return payload;
+  })();
+
+  inFlightLookups.set(cacheKey, runPromise);
+  try {
+    return await runPromise;
+  } finally {
+    inFlightLookups.delete(cacheKey);
+  }
+}
+
+function buildGeneMetadataFromLookup(payload: LiveLookupResponse): GeneMetadata | null {
+  const sym = payload.resolvedGene;
+  if (!sym) return null;
+  const maxAa = payload.variants.reduce((m, v) => Math.max(m, v.aaPosition ?? 0), 0);
+  const liveConditions =
+    payload.geneConditions && payload.geneConditions.length > 0
+      ? payload.geneConditions.map((c) => c.condition)
+      : payload.clingenSummary
+        ? [payload.clingenSummary.diseaseLabel]
+        : [`${sym}-associated phenotype`];
+
+  return {
+    symbol: sym,
+    fullName: payload.geneInfo?.fullName || `${sym} (Live Cohort)`,
+    chromosome: 'GRCh38',
+    proteinLengthAa: Math.max(400, Math.ceil(((maxAa || 500) * 1.15) / 50) * 50),
+    transcriptId: payload.geneInfo?.ensemblGeneId || 'Ensembl Live',
+    primaryConditions: liveConditions,
+    conditionDetails: payload.geneConditions,
+    clingenValidity: payload.clingenSummary?.classification || 'Moderate',
+    clingenExpertPanel: payload.clingenSummary?.expertPanel || 'ClinGen Live Curation',
+    inheritance: payload.clingenSummary?.moi || 'Curated',
+    vusBurdenNote:
+      payload.clinvarTotalVus !== null
+        ? `${payload.clinvarTotalVus.toLocaleString()} VUS in ClinVar`
+        : 'Live database cohort',
+    domains: [],
   };
 }
 
@@ -609,315 +920,13 @@ export async function createApp() {
     }
   });
 
-async function executeSingleLookup(
-  rawQuery: string,
-  size = 18,
-): Promise<LiveLookupResponse> {
-  const cacheKey = `${rawQuery.trim().toUpperCase()}::${size}`;
-  const cached = lookupResultCache.get(cacheKey);
-  if (cached && Date.now() - cached.storedAt < LOOKUP_CACHE_TTL_MS) {
-    return cached.payload;
-  }
-
-  const pending = inFlightLookups.get(cacheKey);
-  if (pending) {
-    return pending;
-  }
-
-  const runPromise = (async () => {
-    const parsed = parseLookupInput(rawQuery);
-    let myVariantQuery: string;
-
-  if (parsed.isRsId && parsed.variantToken) {
-    myVariantQuery = `dbsnp.rsid:${parsed.variantToken}`;
-  } else if (parsed.geneHint && parsed.variantToken) {
-    myVariantQuery = `(clinvar.gene.symbol:${parsed.geneHint} OR dbnsfp.genename:${parsed.geneHint}) AND "${parsed.variantToken}"`;
-  } else if (parsed.isHgvs && parsed.variantToken) {
-    myVariantQuery = `"${parsed.variantToken}"`;
-  } else {
-    const gene = parsed.geneHint || parsed.cleanQ.toUpperCase();
-    myVariantQuery = `(clinvar.gene.symbol:${gene} OR dbnsfp.genename:${gene}) AND (clinvar.rcv.clinical_significance:"Uncertain significance" OR clinvar.rcv.clinical_significance:"Conflicting")`;
-  }
-
-  const initialGene = parsed.geneHint;
-  const [
-    mvResult,
-    clingenMapResult,
-    myGeneInitialResult,
-    clinvarCountInitialResult,
-    pubmedInitialResult,
-    pathNeighborsInitialResult,
-  ] = await Promise.allSettled([
-    fetchMyVariant(myVariantQuery, size),
-    getClinGenMap(),
-    initialGene ? fetchMyGeneInfo(initialGene) : Promise.resolve(null),
-    initialGene ? fetchClinVarTotalVusCount(initialGene) : Promise.resolve(null),
-    fetchPubMedEvidence(
-      parsed.isRsId && parsed.variantToken
-        ? parsed.variantToken
-        : initialGene
-          ? `${initialGene}[Title/Abstract] AND ("variant of uncertain significance"[Title/Abstract] OR VUS[Title/Abstract] OR functional[Title/Abstract])`
-          : `${rawQuery}[Title/Abstract]`,
-    ),
-    initialGene
-      ? fetchMyVariant(
-          `(clinvar.gene.symbol:${initialGene} OR dbnsfp.genename:${initialGene}) AND (clinvar.rcv.clinical_significance:"Pathogenic" OR clinvar.rcv.clinical_significance:"Likely pathogenic")`,
-          25,
-        )
-      : Promise.resolve(null),
-  ]);
-
-  if (mvResult.status === 'rejected') {
-    throw new Error(
-      mvResult.reason instanceof Error ? mvResult.reason.message : 'MyVariant request failed',
-    );
-  }
-
-  const data = mvResult.value;
-  const hits = data.hits ?? [];
-
-  const hitGene =
-    asString(firstScalar(hits[0]?.clinvar?.gene)?.symbol) ||
-    asString(hits[0]?.dbnsfp?.genename) ||
-    null;
-  const resolvedGene = (initialGene || hitGene || '').toUpperCase() || null;
-
-  let geneInfo =
-    myGeneInitialResult.status === 'fulfilled' ? myGeneInitialResult.value : null;
-  let clinvarTotalVus =
-    clinvarCountInitialResult.status === 'fulfilled' ? clinvarCountInitialResult.value : null;
-  let neighborData =
-    pathNeighborsInitialResult.status === 'fulfilled'
-      ? pathNeighborsInitialResult.value
-      : null;
-
-  if (!initialGene && resolvedGene) {
-    const [mgRes, cvRes, nbRes] = await Promise.allSettled([
-      fetchMyGeneInfo(resolvedGene),
-      fetchClinVarTotalVusCount(resolvedGene),
-      fetchMyVariant(
-        `(clinvar.gene.symbol:${resolvedGene} OR dbnsfp.genename:${resolvedGene}) AND (clinvar.rcv.clinical_significance:"Pathogenic" OR clinvar.rcv.clinical_significance:"Likely pathogenic")`,
-        25,
-      ),
-    ]);
-    if (mgRes.status === 'fulfilled') geneInfo = mgRes.value;
-    if (cvRes.status === 'fulfilled') clinvarTotalVus = cvRes.value;
-    if (nbRes.status === 'fulfilled') neighborData = nbRes.value;
-  }
-
-  const clingenMap =
-    clingenMapResult.status === 'fulfilled'
-      ? clingenMapResult.value
-      : new Map<string, ClinGenCurationEntry[]>();
-  const clingenEntries: ClinGenCurationEntry[] = resolvedGene
-    ? clingenMap.get(resolvedGene) ?? []
-    : [];
-  const clingenEntry = pickBestClinGenCuration(clingenEntries);
-
-  const geneConditions: GeneConditionAssociation[] =
-    mapClinGenEntriesToConditions(clingenEntries);
-  const seenCondKeys = new Set(
-    geneConditions.map((c) => c.condition.toLowerCase()),
-  );
-
-  for (const hit of hits) {
-    for (const cvCond of extractAllClinVarConditions(hit.clinvar?.rcv)) {
-      const key = cvCond.toLowerCase();
-      if (!seenCondKeys.has(key) && geneConditions.length < 10) {
-        seenCondKeys.add(key);
-        geneConditions.push({
-          condition: cvCond,
-          inheritance: clingenEntry
-            ? formatInheritanceLabel(clingenEntry.moi)
-            : 'ClinVar Reported',
-          clingenValidity: clingenEntry?.classification ?? 'Moderate',
-          clinicalSpectrumNote:
-            'Associated phenotype reported across ClinVar variant submissions for this gene.',
-        });
-      }
-    }
-  }
-
-  const allGeneConditions = geneConditions.map((c) => c.condition);
-
-  const pubmedEvidence =
-    pubmedInitialResult.status === 'fulfilled'
-      ? pubmedInitialResult.value
-      : { count: 0, articles: [] };
-
-  const classifiedNeighbors = extractClassifiedNeighbors(neighborData?.hits ?? []);
-
-  const variants = hits.map((hit, idx) =>
-    mapMyVariantToRecord(hit, idx, {
-      fallbackGene: resolvedGene || 'QUERY',
-      clingen: clingenEntry,
-      allGeneConditions,
-      ensemblGeneId: geneInfo?.ensemblGeneId ?? null,
-      geneInterproDomains: geneInfo?.interproDomains ?? [],
-      pubmedCount: pubmedEvidence.count,
-      pubmedArticles: pubmedEvidence.articles,
-      classifiedNeighbors,
-    }),
-  );
-
-  const hasGnomad = variants.some((v) => v.gnomadAf > 0);
-  const hasDbnsfp = variants.some(
-    (v) =>
-      v.revelScore !== null ||
-      v.caddPhred !== null ||
-      v.siftScore !== null ||
-      (v.alphaMissenseScore !== undefined && v.alphaMissenseScore !== null),
-  );
-
-  const sources: LiveDatabaseConnectionInfo[] = [
-    {
-      id: 'clinvar',
-      name: 'ClinVar (NCBI)',
-      status: 'connected',
-      summary:
-        clinvarTotalVus !== null
-          ? `${clinvarTotalVus.toLocaleString()} gene VUS indexed · ${variants.length} fetched`
-          : `${variants.length} variant records fetched`,
-      url: resolvedGene
-        ? `https://www.ncbi.nlm.nih.gov/clinvar/?term=${encodeURIComponent(`${resolvedGene}[gene]`)}`
-        : undefined,
-    },
-    {
-      id: 'gnomad',
-      name: 'gnomAD v4',
-      status: variants.length > 0 ? 'connected' : 'partial',
-      summary:
-        variants.length > 0
-          ? hasGnomad
-            ? 'Allele frequencies & PopMax annotated via MyVariant'
-            : 'Checked (fetched alleles absent / AF = 0)'
-          : 'No variants returned to annotate',
-      url: resolvedGene
-        ? `https://gnomad.broadinstitute.org/gene/${encodeURIComponent(resolvedGene)}`
-        : undefined,
-    },
-    {
-      id: 'pubmed',
-      name: 'PubMed (NCBI)',
-      status: pubmedInitialResult.status === 'fulfilled' ? 'connected' : 'unavailable',
-      summary:
-        pubmedEvidence.count > 0
-          ? `${pubmedEvidence.count.toLocaleString()} VUS/functional citations`
-          : '0 matching VUS citations',
-      url: resolvedGene
-        ? `https://pubmed.ncbi.nlm.nih.gov/?term=${encodeURIComponent(`${resolvedGene} variant of uncertain significance`)}`
-        : undefined,
-    },
-    {
-      id: 'clingen',
-      name: 'ClinGen Validity',
-      status: clingenMap.size > 0 ? 'connected' : 'unavailable',
-      summary: clingenEntry
-        ? clingenEntries.length > 1
-          ? `${clingenEntries.length} ClinGen curations (${clingenEntry.classification}: ${clingenEntries.map((e) => e.diseaseLabel).slice(0, 2).join('; ')})`
-          : `${clingenEntry.classification} (${clingenEntry.diseaseLabel})`
-        : resolvedGene
-          ? `No ClinGen validity curation for ${resolvedGene}`
-          : 'Curated gene-disease table loaded',
-      url: clingenEntry?.reportUrl ?? 'https://search.clinicalgenome.org/kb/gene-validity',
-    },
-    {
-      id: 'ensembl',
-      name: 'Ensembl / InterPro',
-      status: geneInfo?.ensemblGeneId ? 'connected' : 'partial',
-      summary: geneInfo?.ensemblGeneId
-        ? `${geneInfo.ensemblGeneId} · ${geneInfo.interproDomains.length} InterPro domains`
-        : 'Domain annotations via dbNSFP',
-      url: geneInfo?.ensemblGeneId
-        ? `https://www.ensembl.org/Homo_sapiens/Gene/Summary?g=${encodeURIComponent(geneInfo.ensemblGeneId)}`
-        : undefined,
-    },
-    {
-      id: 'dbnsfp',
-      name: 'dbNSFP & CADD',
-      status: hasDbnsfp ? 'connected' : 'partial',
-      summary: hasDbnsfp
-        ? 'REVEL, AlphaMissense, CADD Phred, SIFT & PolyPhen-2 loaded'
-        : 'Scores unavailable for non-missense hits',
-    },
-  ];
-
-    const payload: LiveLookupResponse = {
-      query: rawQuery,
-      resolvedGene,
-      totalMatches: data.total ?? variants.length,
-      clinvarTotalVus,
-      pubmedArticleCount: pubmedEvidence.count,
-      pubmedArticles: pubmedEvidence.articles,
-      clingenSummary: clingenEntry
-        ? {
-            gene: clingenEntry.geneSymbol,
-            classification: clingenEntry.classification,
-            diseaseLabel: clingenEntry.diseaseLabel,
-            moi: clingenEntry.moi,
-            expertPanel: clingenEntry.expertPanel,
-            reportUrl: clingenEntry.reportUrl,
-            actionabilityScore: clingenTierToActionability(clingenEntry.classification),
-          }
-        : null,
-      geneConditions,
-      geneInfo,
-      sources,
-      variants,
-    };
-
-    if (lookupResultCache.size >= LOOKUP_CACHE_MAX_ENTRIES) {
-      const oldestKey = lookupResultCache.keys().next().value;
-      if (oldestKey) lookupResultCache.delete(oldestKey);
-    }
-    lookupResultCache.set(cacheKey, { storedAt: Date.now(), payload });
-    return payload;
-  })();
-
-  inFlightLookups.set(cacheKey, runPromise);
-  try {
-    return await runPromise;
-  } finally {
-    inFlightLookups.delete(cacheKey);
-  }
-}
-
-function buildGeneMetadataFromLookup(payload: LiveLookupResponse): GeneMetadata | null {
-  const sym = payload.resolvedGene;
-  if (!sym) return null;
-  const maxAa = payload.variants.reduce((m, v) => Math.max(m, v.aaPosition ?? 0), 0);
-  const liveConditions =
-    payload.geneConditions && payload.geneConditions.length > 0
-      ? payload.geneConditions.map((c) => c.condition)
-      : payload.clingenSummary
-        ? [payload.clingenSummary.diseaseLabel]
-        : [`${sym}-associated phenotype`];
-
-  return {
-    symbol: sym,
-    fullName: payload.geneInfo?.fullName || `${sym} (Live Cohort)`,
-    chromosome: 'GRCh38',
-    proteinLengthAa: Math.max(400, Math.ceil(((maxAa || 500) * 1.15) / 50) * 50),
-    transcriptId: payload.geneInfo?.ensemblGeneId || 'Ensembl Live',
-    primaryConditions: liveConditions,
-    conditionDetails: payload.geneConditions,
-    clingenValidity: payload.clingenSummary?.classification || 'Moderate',
-    clingenExpertPanel: payload.clingenSummary?.expertPanel || 'ClinGen Live Curation',
-    inheritance: payload.clingenSummary?.moi || 'Curated',
-    vusBurdenNote:
-      payload.clinvarTotalVus !== null
-        ? `${payload.clinvarTotalVus.toLocaleString()} VUS in ClinVar`
-        : 'Live database cohort',
-    domains: [],
-  };
-}
-
   app.get('/api/lookup', async (req: Request, res: Response) => {
     const rawQuery = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const size = Math.min(25, Math.max(5, Number(req.query.size) || 18));
     if (!rawQuery || rawQuery.length < 2) {
       res.status(400).json({
-        error: 'Provide a gene symbol (e.g. PALB2, BRCA2), HGVS notation, or rsID (e.g. rs80357433).',
+        error:
+          'Provide a gene symbol (e.g. PALB2, BRCA2), HGVS notation, or rsID (e.g. rs80357433).',
       });
       return;
     }
@@ -999,7 +1008,8 @@ function buildGeneMetadataFromLookup(payload: LiveLookupResponse): GeneMetadata 
 
     if (cleaned.length === 0) {
       res.status(400).json({
-        error: 'Provide an array of 1 to 25 gene symbols, HGVS strings, or rsIDs in "queries", or an "offset" for genome batch crawling.',
+        error:
+          'Provide an array of 1 to 25 gene symbols, HGVS strings, or rsIDs in "queries", or an "offset" for genome batch crawling.',
       });
       return;
     }
@@ -1018,7 +1028,6 @@ function buildGeneMetadataFromLookup(payload: LiveLookupResponse): GeneMetadata 
     let latestSources: LiveDatabaseConnectionInfo[] = [];
     let rateLimited = false;
 
-    // Process in bounded chunks of 4 to respect NCBI / MyVariant rate limits
     for (let i = 0; i < cleaned.length; i += 4) {
       const chunk = cleaned.slice(i, i + 4);
       const settled = await Promise.allSettled(
@@ -1030,146 +1039,4 @@ function buildGeneMetadataFromLookup(payload: LiveLookupResponse): GeneMetadata 
         if (outcome.status === 'fulfilled') {
           const payload = outcome.value;
           if (payload.sources.length > 0) latestSources = payload.sources;
-          const canonicalGene = payload.resolvedGene || q.toUpperCase();
-          resolvedGenes.add(canonicalGene);
-          const meta = buildGeneMetadataFromLookup({
-            ...payload,
-            resolvedGene: canonicalGene,
-          });
-          if (meta) geneMeta[canonicalGene] = meta;
-
-          for (const v of payload.variants) {
-            const key = `${v.gene}:${v.clinvarId}:${v.hgvsC}`;
-            if (!seenVariantKey.has(key)) {
-              seenVariantKey.add(key);
-              allVariants.push(v);
-            }
-          }
-          results.push({
-            query: q,
-            resolvedGene: payload.resolvedGene ?? canonicalGene,
-            matchedCount: payload.variants.length,
-            status: payload.variants.length > 0 ? 'ok' : 'empty',
-            message:
-              payload.variants.length > 0
-                ? `${payload.variants.length} VUS fetched`
-                : 'Connected, 0 VUS matched',
-          });
-        } else {
-          const errMsg =
-            outcome.reason instanceof Error
-              ? outcome.reason.message
-              : 'Lookup error';
-          if (isRateLimitErrorMessage(errMsg)) {
-            rateLimited = true;
-          }
-          results.push({
-            query: q,
-            resolvedGene: null,
-            matchedCount: 0,
-            status: 'error',
-            message: errMsg,
-          });
-        }
-      });
-    }
-
-    const batchPayload: BatchLookupResponse = {
-      queries: cleaned,
-      results,
-      variants: allVariants,
-      resolvedGenes: Array.from(resolvedGenes).sort(),
-      geneMeta,
-      sources: latestSources,
-      ...(nextOffset !== undefined ? { nextOffset } : {}),
-      ...(totalCatalogGenes !== undefined ? { totalCatalogGenes } : {}),
-      ...(requestedOffset !== null ? { rateLimited } : {}),
-      ...(catalogSource !== undefined ? { catalogSource } : {}),
-    };
-
-    res.json(batchPayload);
-  });
-
-  app.post('/api/annotate/batch', (req: Request, res: Response) => {
-    const rawPayload = typeof req.body?.payload === 'string' ? req.body.payload : '';
-    const requestedFormat = req.body?.format;
-
-    if (!rawPayload.trim()) {
-      res.status(400).json({ error: 'Provide non-empty sequencing payload text.' });
-      return;
-    }
-
-    const format =
-      requestedFormat === 'vcf' || requestedFormat === 'cma' || requestedFormat === 'tsv'
-        ? requestedFormat
-        : detectPipelineFormat(rawPayload);
-
-    const parsed =
-      format === 'vcf'
-        ? parseVcfVariants(rawPayload)
-        : format === 'cma'
-          ? parseCmaBedVariants(rawPayload)
-          : parseImportedCsv(rawPayload);
-
-    const acmgSummary = summarizeAcmgBatch(parsed.variants);
-    const response: BatchAnnotateResponse = {
-      format,
-      totalParsed: parsed.variants.length,
-      variants: parsed.variants,
-      acmgSummary,
-      errors: parsed.errors,
-    };
-
-    res.json(response);
-  });
-
-  return { app, runLocalDbToolSync };
-}
-
-if (!process.env.VERCEL) {
-  createApp()
-    .then(async ({ app, runLocalDbToolSync }) => {
-      const httpServer = http.createServer(app);
-
-if (!process.env.VERCEL) {
-  createApp()
-    .then(async ({ app, runLocalDbToolSync }) => {
-      const httpServer = http.createServer(app);
-
-      if (process.env.NODE_ENV !== 'production') {
-        const { createServer: createViteServer } = await import('vite');
-        const vite = await createViteServer({
-          server: {
-            middlewareMode: true,
-            ws: { server: httpServer },
-            hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
-          },
-          appType: 'spa',
-        });
-        app.use(vite.middlewares);
-      } else {
-        const distDir = path.resolve(__dirname, 'dist');
-        app.use(express.static(distDir));
-        app.get('*', (_req: Request, res: Response) => {
-          const indexFile = path.join(distDir, 'index.html');
-          if (fs.existsSync(indexFile)) {
-            res.sendFile(indexFile);
-          } else {
-            res.status(404).send('Build output not found.');
-          }
-        });
-      }
-
-      const port = Number(process.env.PORT ?? 3000);
-      httpServer.listen(port, '0.0.0.0', () => {
-        console.log(`VUScope server running on http://localhost:${port}`);
-        setTimeout(() => {
-          void runLocalDbToolSync().catch(() => {});
-        }, 1200);
-      });
-    })
-    .catch((err) => {
-      console.error('Failed to start server:', err);
-      process.exit(1);
-    });
-}
+          const canonicalGene = payload.resolvedGene || q.toUpper
