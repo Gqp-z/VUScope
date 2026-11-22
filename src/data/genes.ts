@@ -1,4 +1,4 @@
-import type { GeneMetadata, ResearchPreset } from '../types/variant';
+import type { GeneMetadata, ResearchPreset } from '../types/variant.js';
 
 export const GENE_METADATA: Record<string, GeneMetadata> = {
   BRCA1: {
