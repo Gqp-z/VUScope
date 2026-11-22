@@ -1,9 +1,9 @@
-import { GENE_METADATA } from '../data/genes';
-import type { GenomeGeneCatalogEntry } from '../types/variant';
+import { GENE_METADATA } from '../data/genes.js';
+import type { GenomeGeneCatalogEntry } from '../types/variant.js';
 import {
   pickBestClinGenCuration,
   type ClinGenCurationEntry,
-} from './liveDatabaseMappers';
+} from './liveDatabaseMappers.js';
 
 const CORE_BENCHMARK_GENES = new Set(['BRCA1', 'TP53', 'MYH7', 'SCN5A', 'CFTR']);
 
