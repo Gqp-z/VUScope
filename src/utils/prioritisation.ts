@@ -1,5 +1,5 @@
-import { EXTENDED_GENE_METADATA } from '../data/extendedGenomes';
-import { GENE_METADATA, RESEARCH_PRESETS } from '../data/genes';
+import { EXTENDED_GENE_METADATA } from '../data/extendedGenomes.js';
+import { GENE_METADATA, RESEARCH_PRESETS } from '../data/genes.js';
 import type {
   CohortSummaryStats,
   EvaluationComparisonRow,
@@ -14,8 +14,8 @@ import type {
   ScoringConfig,
   VariantRecord,
   VariantType,
-} from '../types/variant';
-import { evaluateAcmgCriteria } from './acmgAutomation';
+} from '../types/variant.js';
+import { evaluateAcmgCriteria } from './acmgAutomation.js';
 
 export const DEFAULT_WEIGHTS: PrioritisationWeights = {
   populationFrequency: 18,
