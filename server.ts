@@ -100,7 +100,7 @@ async function getClinGenMap(): Promise> {
         timeoutMs: 9000,
       });
       if (!resp.ok) {
-        return clingenCache?.byGene ?? new Map();
+        return clingenCache?.byGene ?? new Map<string, ClinGenCurationEntry[]>();
       }
       const csvText = await resp.text();
       const byGene = parseClinGenValidityCsv(csvText);
@@ -110,7 +110,7 @@ async function getClinGenMap(): Promise> {
       };
       return byGene;
     } catch {
-      return clingenCache?.byGene ?? new Map();
+      return clingenCache?.byGene ?? new Map<string, ClinGenCurationEntry[]>();
     } finally {
       clingenLoadPromise = null;
     }
@@ -1039,4 +1039,144 @@ export async function createApp() {
         if (outcome.status === 'fulfilled') {
           const payload = outcome.value;
           if (payload.sources.length > 0) latestSources = payload.sources;
-          const canonicalGene = payload.resolvedGene || q.toUpper
+          const canonicalGene = payload.resolvedGene || q.toUpperCase();
+          resolvedGenes.add(canonicalGene);
+          const meta = buildGeneMetadataFromLookup({
+            ...payload,
+            resolvedGene: canonicalGene,
+          });
+          if (meta) geneMeta[canonicalGene] = meta;
+
+          for (const v of payload.variants) {
+            const key = `${v.gene}:${v.clinvarId}:${v.hgvsC}`;
+            if (!seenVariantKey.has(key)) {
+              seenVariantKey.add(key);
+              allVariants.push(v);
+            }
+          }
+          results.push({
+            query: q,
+            resolvedGene: payload.resolvedGene ?? canonicalGene,
+            matchedCount: payload.variants.length,
+            status: payload.variants.length > 0 ? 'ok' : 'empty',
+            message:
+              payload.variants.length > 0
+                ? `${payload.variants.length} VUS fetched`
+                : 'Connected, 0 VUS matched',
+          });
+        } else {
+          const errMsg =
+            outcome.reason instanceof Error
+              ? outcome.reason.message
+              : 'Lookup error';
+          if (isRateLimitErrorMessage(errMsg)) {
+            rateLimited = true;
+          }
+          results.push({
+            query: q,
+            resolvedGene: null,
+            matchedCount: 0,
+            status: 'error',
+            message: errMsg,
+          });
+        }
+      });
+    }
+
+    const batchPayload: BatchLookupResponse = {
+      queries: cleaned,
+      results,
+      variants: allVariants,
+      resolvedGenes: Array.from(resolvedGenes).sort(),
+      geneMeta,
+      sources: latestSources,
+      ...(nextOffset !== undefined ? { nextOffset } : {}),
+      ...(totalCatalogGenes !== undefined ? { totalCatalogGenes } : {}),
+      ...(requestedOffset !== null ? { rateLimited } : {}),
+      ...(catalogSource !== undefined ? { catalogSource } : {}),
+    };
+
+    res.json(batchPayload);
+  });
+
+  app.post('/api/annotate/batch', (req: Request, res: Response) => {
+    const rawPayload = typeof req.body?.payload === 'string' ? req.body.payload : '';
+    const requestedFormat = req.body?.format;
+
+    if (!rawPayload.trim()) {
+      res.status(400).json({ error: 'Provide non-empty sequencing payload text.' });
+      return;
+    }
+
+    const format =
+      requestedFormat === 'vcf' || requestedFormat === 'cma' || requestedFormat === 'tsv'
+        ? requestedFormat
+        : detectPipelineFormat(rawPayload);
+
+    const parsed =
+      format === 'vcf'
+        ? parseVcfVariants(rawPayload)
+        : format === 'cma'
+          ? parseCmaBedVariants(rawPayload)
+          : parseImportedCsv(rawPayload);
+
+    const acmgSummary = summarizeAcmgBatch(parsed.variants);
+    const response: BatchAnnotateResponse = {
+      format,
+      totalParsed: parsed.variants.length,
+      variants: parsed.variants,
+      acmgSummary,
+      errors: parsed.errors,
+    };
+
+    res.json(response);
+  });
+
+  return { app, runLocalDbToolSync };
+}
+
+if (!process.env.VERCEL) {
+  createApp()
+    .then(async ({ app, runLocalDbToolSync }) => {
+      const httpServer = http.createServer(app);
+
+      if (process.env.NODE_ENV !== 'production') {
+        const vitePkg = ['vi', 'te'].join('');
+        const { createServer: createViteServer } = await import(
+          /* @vite-ignore */ vitePkg
+        );
+        const vite = await createViteServer({
+          server: {
+            middlewareMode: true,
+            ws: { server: httpServer },
+            hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+          },
+          appType: 'spa',
+        });
+        app.use(vite.middlewares);
+      } else {
+        const distDir = path.resolve(__dirname, 'dist');
+        app.use(express.static(distDir));
+        app.get('*', (_req: Request, res: Response) => {
+          const indexFile = path.join(distDir, 'index.html');
+          if (fs.existsSync(indexFile)) {
+            res.sendFile(indexFile);
+          } else {
+            res.status(404).send('Build output not found.');
+          }
+        });
+      }
+
+      const port = Number(process.env.PORT ?? 3000);
+      httpServer.listen(port, '0.0.0.0', () => {
+        console.log(`VUScope server running on http://localhost:${port}`);
+        setTimeout(() => {
+          void runLocalDbToolSync().catch(() => {});
+        }, 1200);
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    });
+}
