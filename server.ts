@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createServer as createViteServer } from 'vite';
 import { isPersistentKeyConfigured } from './server/security/cryptoVault.js';
 import {
   createRateLimitMiddleware,
@@ -1133,6 +1132,7 @@ if (!process.env.VERCEL) {
       const httpServer = http.createServer(app);
 
       if (process.env.NODE_ENV !== 'production') {
+        const { createServer: createViteServer } = await import('vite');
         const vite = await createViteServer({
           server: {
             middlewareMode: true,
